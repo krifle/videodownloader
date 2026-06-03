@@ -23,22 +23,44 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.example.videodownaloder.app.DefaultDownloadRepositoryFactory
+import com.example.videodownaloder.domain.DownloadRepository
+import com.example.videodownaloder.domain.DownloadRepositoryResult
 import com.example.videodownaloder.domain.UrlValidationResult
 import com.example.videodownaloder.domain.UrlValidator
 import com.example.videodownaloder.ui.theme.VideodownaloderTheme
 import com.example.videodownaloder.util.ErrorMessageMapper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import androidx.compose.runtime.rememberCoroutineScope
 
 @Composable
-fun DownloadScreen(modifier: Modifier = Modifier) {
-    var url by rememberSaveable { mutableStateOf("") }
-    val validation = remember(url) { UrlValidator.validate(url) }
+fun DownloadScreen(
+    modifier: Modifier = Modifier,
+    repositoryFactory: (android.content.Context) -> DownloadRepository = {
+        DefaultDownloadRepositoryFactory.create(it)
+    },
+) {
+    val context = LocalContext.current
+    val repository = remember(context) { repositoryFactory(context) }
+    val scope = rememberCoroutineScope()
+    var uiState by remember { mutableStateOf(DownloadUiState()) }
+    val validation = remember(uiState.url) { UrlValidator.validate(uiState.url) }
+    val isWorking = uiState.status in setOf(
+        DownloadStatus.FetchingPage,
+        DownloadStatus.Extracting,
+        DownloadStatus.VerifyingVideo,
+        DownloadStatus.Downloading,
+        DownloadStatus.Saving,
+    )
 
     Scaffold(modifier = modifier.fillMaxSize()) { innerPadding ->
         Surface(
@@ -56,18 +78,61 @@ fun DownloadScreen(modifier: Modifier = Modifier) {
             ) {
                 Header()
                 UrlInput(
-                    url = url,
+                    url = uiState.url,
                     validation = validation,
-                    onUrlChange = { url = it },
-                    onClear = { url = "" },
+                    onUrlChange = {
+                        uiState = DownloadUiState(
+                            url = it,
+                            status = if (it.isBlank()) DownloadStatus.Idle else uiState.status,
+                        )
+                    },
+                    onClear = { uiState = DownloadUiState() },
+                    enabled = !isWorking,
                 )
                 DownloadActions(
                     validation = validation,
+                    isWorking = isWorking,
                     onDownloadClick = {
-                        // 실제 다운로드 흐름은 다음 단계에서 Repository와 연결한다.
+                        val supported = (validation as? UrlValidationResult.Supported)?.value
+                            ?: return@DownloadActions
+
+                        scope.launch {
+                            uiState = uiState.copy(
+                                status = DownloadStatus.FetchingPage,
+                                progress = null,
+                                message = "게시물 페이지를 확인하는 중입니다.",
+                                savedFileName = null,
+                            )
+
+                            val result = withContext(Dispatchers.IO) {
+                                repository.download(supported) { progress ->
+                                    scope.launch {
+                                        uiState = uiState.copy(
+                                            status = DownloadStatus.Downloading,
+                                            progress = progress.fraction,
+                                            message = "다운로드 중입니다.",
+                                        )
+                                    }
+                                }
+                            }
+
+                            uiState = when (result) {
+                                is DownloadRepositoryResult.Success -> uiState.copy(
+                                    status = DownloadStatus.Completed,
+                                    progress = 1f,
+                                    message = "갤러리에 저장되었습니다.",
+                                    savedFileName = result.fileName,
+                                )
+                                is DownloadRepositoryResult.Failure -> uiState.copy(
+                                    status = DownloadStatus.Failed,
+                                    progress = null,
+                                    message = ErrorMessageMapper.fromExtractError(result.error),
+                                )
+                            }
+                        }
                     },
                 )
-                StatusPanel(validation = validation)
+                StatusPanel(validation = validation, uiState = uiState)
                 PolicyNotice()
             }
         }
@@ -96,6 +161,7 @@ private fun UrlInput(
     validation: UrlValidationResult,
     onUrlChange: (String) -> Unit,
     onClear: () -> Unit,
+    enabled: Boolean,
 ) {
     val errorText = (validation as? UrlValidationResult.Unsupported)
         ?.takeIf { url.isNotBlank() }
@@ -116,6 +182,7 @@ private fun UrlInput(
                 }
             },
             isError = errorText != null,
+            enabled = enabled,
             singleLine = false,
             minLines = 2,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
@@ -127,7 +194,7 @@ private fun UrlInput(
         ) {
             OutlinedButton(
                 onClick = onClear,
-                enabled = url.isNotBlank(),
+                enabled = enabled && url.isNotBlank(),
             ) {
                 Text("초기화")
             }
@@ -138,29 +205,32 @@ private fun UrlInput(
 @Composable
 private fun DownloadActions(
     validation: UrlValidationResult,
+    isWorking: Boolean,
     onDownloadClick: () -> Unit,
 ) {
     val supported = validation is UrlValidationResult.Supported
 
     Button(
         onClick = onDownloadClick,
-        enabled = supported,
+        enabled = supported && !isWorking,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Text("다운로드")
+        Text(if (isWorking) "처리 중" else "다운로드")
     }
 }
 
 @Composable
-private fun StatusPanel(validation: UrlValidationResult) {
-    val text = when (validation) {
-        is UrlValidationResult.Supported -> {
+private fun StatusPanel(
+    validation: UrlValidationResult,
+    uiState: DownloadUiState,
+) {
+    val text = uiState.message ?: when (validation) {
+        is UrlValidationResult.Supported ->
             "${validation.value.platform.displayName} ${validation.value.contentType.id} URL을 확인했습니다."
-        }
-        is UrlValidationResult.Unsupported -> {
+        is UrlValidationResult.Unsupported ->
             ErrorMessageMapper.fromValidationFailure(validation.reason)
-        }
     }
+    val progress = uiState.progress
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
@@ -173,10 +243,26 @@ private fun StatusPanel(validation: UrlValidationResult) {
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        LinearProgressIndicator(
-            progress = { 0f },
-            modifier = Modifier.fillMaxWidth(),
-        )
+        if (uiState.savedFileName != null) {
+            Text(
+                text = uiState.savedFileName,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        when {
+            progress != null -> LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            uiState.status in setOf(
+                DownloadStatus.FetchingPage,
+                DownloadStatus.Extracting,
+                DownloadStatus.VerifyingVideo,
+                DownloadStatus.Downloading,
+                DownloadStatus.Saving,
+            ) -> LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
     }
 }
 
